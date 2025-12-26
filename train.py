@@ -1,5 +1,4 @@
 import os
- 
 os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] = "2,2,1"
 os.environ["TPU_PROCESS_BOUNDS"] = "1,1,1"
 os.environ["TPU_VISIBLE_DEVICES"] = "0,1,2,3"
@@ -22,13 +21,14 @@ import ml_collections
 from utils.wandb import setup_wandb, default_wandb_config
 from utils.train_state import TrainStateEma
 from utils.checkpoint import Checkpoint
-from utils.stable_vae import StableVAE
+from utils.taesd_vae import TAESDVAE
 from utils.sharding import create_sharding, all_gather
 from utils.datasets import get_dataset
 from model import DiT
+from mamba_model import DiT as DiT_VSSD
 from helper_eval import eval_model
 from helper_inference import do_inference
-from functools import partial
+
 FLAGS = flags.FLAGS
 flags.DEFINE_string('dataset_name', 'imagenet256', 'Environment name.')
 flags.DEFINE_string('load_dir', None, 'Logging dir (if not None, save params).')
@@ -36,14 +36,14 @@ flags.DEFINE_string('save_dir', None, 'Logging dir (if not None, save params).')
 flags.DEFINE_string('fid_stats', None, 'FID stats file.')
 flags.DEFINE_integer('seed', 10, 'Random seed.') # Must be the same across all processes.
 flags.DEFINE_integer('log_interval', 1000, 'Logging interval.')
-flags.DEFINE_integer('eval_interval', 20000, 'Eval interval.')
-flags.DEFINE_integer('save_interval', 100000, 'Eval interval.')
+flags.DEFINE_integer('eval_interval', 10000, 'Eval interval.')
+flags.DEFINE_integer('save_interval', 200000, 'Eval interval.')
 flags.DEFINE_integer('batch_size', 32, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 flags.DEFINE_string('mode', 'train', 'train or inference.')
+flags.DEFINE_boolean('use_vssd', True, 'Use VSSD model.')
 
- 
 
 model_config = ml_collections.ConfigDict({
     'lr': 0.0001,
@@ -60,7 +60,7 @@ model_config = ml_collections.ConfigDict({
     'mlp_ratio': 1, # change this!
     'class_dropout_prob': 0.1,
     'num_classes': 1000,
-    'denoise_timesteps': 256,
+    'denoise_timesteps': 128,
     'cfg_scale': 4.0,
     'target_update_rate': 0.999,
     'use_ema': 0,
@@ -72,7 +72,8 @@ model_config = ml_collections.ConfigDict({
     'bootstrap_every': 8, # Make sure its a divisor of batch size.
     'bootstrap_ema': 1,
     'bootstrap_dt_bias': 0,
-    'train_type': 'shortcut' # or naive.
+    'train_type': 'shortcut', # or naive.
+    'use_vssd': 1,
 })
 
 
@@ -100,7 +101,12 @@ def main(_):
     print("Global Batch: ", FLAGS.batch_size)
     print("Node Batch: ", local_batch_size)
     print("Device Batch:", local_batch_size // device_count)
-
+ 
+    print("DEBUGGING: INSIDE main()")
+    print(f"FLAGS.mode = {FLAGS.mode}")
+    print(f"FLAGS.max_steps = {FLAGS.max_steps}")
+    print(f"FLAGS.inference_generations = {FLAGS.inference_generations}")
+ 
     # Create wandb logger
     if jax.process_index() == 0 and FLAGS.mode == 'train':
         setup_wandb(FLAGS.model.to_dict(), **FLAGS.wandb)
@@ -111,8 +117,8 @@ def main(_):
     example_obs = example_obs[:1]
     example_obs_shape = example_obs.shape
 
-    if FLAGS.model.use_stable_vae==1:
-        vae = StableVAE.create()
+    if FLAGS.model.use_stable_vae:
+        vae = TAESDVAE.create()
         if 'latent' in FLAGS.dataset_name:
             example_obs = example_obs[:, :, :, example_obs.shape[-1] // 2:]
             example_obs_shape = example_obs.shape
@@ -148,9 +154,12 @@ def main(_):
         'dropout': FLAGS.model['dropout'],
         'ignore_dt': False if (FLAGS.model['train_type'] in ('shortcut', 'livereflow')) else True,
     }
-    model_def = DiT(**dit_args)
+    if FLAGS.use_vssd == 1:
+        model_def = DiT_VSSD(**dit_args)
+    else:
+        model_def = DiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
-    print(tabulate_fn(example_obs, jnp.zeros((1,)), jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
+    #print(tabulate_fn(example_obs, jnp.zeros((1,)), jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
 
     if FLAGS.model.use_cosine:
         lr_schedule = optax.warmup_cosine_decay_schedule(0.0, FLAGS.model['lr'], FLAGS.model['warmup'], FLAGS.max_steps)
@@ -177,7 +186,7 @@ def main(_):
 
     data_sharding, train_state_sharding, no_shard, shard_data, global_to_local = create_sharding(FLAGS.model.sharding, train_state_shape)
     train_state = jax.jit(init, out_shardings=train_state_sharding)(rng)
-    #jax.debug.visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'])
+   # jax.debug.visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'])
     #jax.debug.visualize_array_sharding(train_state.params['TimestepEmbedder_1']['Dense_0']['kernel'])
     #jax.experimental.multihost_utils.assert_equal(train_state.params['TimestepEmbedder_1']['Dense_0']['kernel'])
     start_step = 1
@@ -244,16 +253,14 @@ def main(_):
         # =================================================================
         # ^ ^ ^ ^ ^ ^ ^ ^ ^ ^  修复代码结束  ^ ^ ^ ^ ^ ^ ^ ^ ^ ^
         # =================================================================
-
-
-
         train_state = train_state.replace(**replace_dict)
+
         if FLAGS.wandb.run_id != "None": # If we are continuing a run.
             start_step = train_state.step
         train_state = jax.jit(lambda x : x, out_shardings=train_state_sharding)(train_state)
         print("Loaded model with step", train_state.step)
         train_state = train_state.replace(step=0)
-        #jax.debug.visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'])
+        #jax..visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'])
         del cp
 
     if FLAGS.model.train_type == 'progressive' or FLAGS.model.train_type == 'consistency-distillation':
@@ -335,13 +342,11 @@ def main(_):
         train_state = train_state.update_ema(FLAGS.model['target_update_rate'])
         return train_state, info
     
-    if FLAGS.mode == 'inference':
+    if FLAGS.mode != 'train':
         do_inference(FLAGS, train_state, None, dataset, dataset_valid, shard_data, vae_encode, vae_decode, update,
                        get_fid_activations, imagenet_labels, visualize_labels, 
                        fid_from_stats, truth_fid_stats)
         return
-    
-
 
     ###################################
     # Train Loop
@@ -399,3 +404,5 @@ def main(_):
 
 if __name__ == '__main__':
     app.run(main)
+
+
