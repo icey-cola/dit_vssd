@@ -1,7 +1,18 @@
 import os
-os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] = "2,2,1"
-os.environ["TPU_PROCESS_BOUNDS"] = "1,1,1"
-os.environ["TPU_VISIBLE_DEVICES"] = "0,1,2,3"
+import sys
+
+# 检查是否使用单卡推理（在 import jax 之前设置环境变量）
+if '--single_device_inference=True' in sys.argv or '--single_device_inference=true' in sys.argv:
+    print("🔧 配置单卡推理模式 (Chip 0 only)")
+    os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] = "1,1,1"
+    os.environ["TPU_PROCESS_BOUNDS"] = "1,1,1"
+    os.environ["TPU_VISIBLE_DEVICES"] = "1"
+else:
+    print("🔧 配置多卡推理模式 (4 devices)")
+    os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] = "2,2,1"
+    os.environ["TPU_PROCESS_BOUNDS"] = "1,1,1"
+    os.environ["TPU_VISIBLE_DEVICES"] = "0,1,2,3"
+
 os.environ["TFDS_DATA_DIR"] = "gs://trc-2/"
 
 from typing import Any
@@ -22,6 +33,7 @@ from utils.wandb import setup_wandb, default_wandb_config
 from utils.train_state import TrainStateEma
 from utils.checkpoint import Checkpoint
 from utils.taesd_vae import TAESDVAE
+from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding, all_gather
 from utils.datasets import get_dataset
 from model import DiT
@@ -43,6 +55,8 @@ flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 flags.DEFINE_string('mode', 'train', 'train or inference.')
 flags.DEFINE_boolean('use_vssd', True, 'Use VSSD model.')
+flags.DEFINE_string('vae_type', 'taesd', 'VAE type: "stable" or "taesd"')
+flags.DEFINE_boolean('single_device_inference', False, 'Use single device for inference (True) or multi-device (False, default).')
 
 
 model_config = ml_collections.ConfigDict({
@@ -118,7 +132,10 @@ def main(_):
     example_obs_shape = example_obs.shape
 
     if FLAGS.model.use_stable_vae:
-        vae = TAESDVAE.create()
+        if FLAGS.vae_type == 'taesd':
+            vae = TAESDVAE.create()
+        else:
+            vae = StableVAE.create()
         if 'latent' in FLAGS.dataset_name:
             example_obs = example_obs[:, :, :, example_obs.shape[-1] // 2:]
             example_obs_shape = example_obs.shape
@@ -218,28 +235,28 @@ def main(_):
                         # --- 修复 Kernel (Dense & Conv) ---
                         if name == 'kernel':
                             if len(value.shape) == 5: # Conv kernel
-                                print(f"--> Downgrading KERNEL at {current_path} from 5D to 4D...")
+                               # print(f"--> Downgrading KERNEL at {current_path} from 5D to 4D...")
                                 param_dict[name] = jnp.squeeze(value, axis=0)
                             elif len(value.shape) == 3: # Dense kernel
-                                print(f"--> Downgrading KERNEL at {current_path} from 3D to 2D...")
+                               # print(f"--> Downgrading KERNEL at {current_path} from 3D to 2D...")
                                 param_dict[name] = jnp.squeeze(value, axis=0)
                         
                         # --- 修复 Bias (Dense & Conv) ---
                         if name == 'bias':
                             if len(value.shape) == 2:
-                                print(f"--> Downgrading BIAS at {current_path} from 2D to 1D...")
+                                #print(f"--> Downgrading BIAS at {current_path} from 2D to 1D...")
                                 param_dict[name] = jnp.squeeze(value, axis=0)
                                 
                         # --- 修复 Embedding ---
                         if name == 'embedding':
                             if len(value.shape) == 3:
-                                print(f"--> Downgrading EMBEDDING at {current_path} from 3D to 2D...")
+                               # print(f"--> Downgrading EMBEDDING at {current_path} from 3D to 2D...")
                                 param_dict[name] = jnp.squeeze(value, axis=0)
                                 
                         # --- 新增: 修复 dt_bias ---
                         if name in ['dt_bias', 'A_log', 'D','scale']:
                             if len(value.shape) == 2:
-                                print(f"--> Downgrading '{name}' at {current_path} from 2D to 1D...")
+                             #   print(f"--> Downgrading '{name}' at {current_path} from 2D to 1D...")
                                 param_dict[name] = jnp.squeeze(value, axis=0)
             
          # 从根参数字典开始递归修复

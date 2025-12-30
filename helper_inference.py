@@ -6,6 +6,7 @@ import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
 import os
+import time
 from functools import partial
 from absl import app, flags
 from PIL import Image
@@ -45,7 +46,9 @@ def do_inference(
     def process_img(img):
         if FLAGS.model.use_stable_vae:
             img = vae_decode(img[None])[0]
-        img = img * 0.5 + 0.5
+        # TAESD 输出 [0,1]，StableVAE 输出 [-1,1]
+        if FLAGS.vae_type == 'stable':
+            img = img * 0.5 + 0.5  # [-1,1] -> [0,1]
         img = jnp.clip(img, 0, 1)
         img = np.array(img)
         return img
@@ -85,15 +88,45 @@ def do_inference(
     print(f"Local variable 'num_generations' is set to: {num_generations}")
 
     cfg_scale = FLAGS.inference_cfg_scale
-    x0 = []
-    x1 = []
-    lab = []
-    x_render = []
-    activations = []
+    x_render = []  # 只在需要保存图像时才收集
+    activations = []  # 保持分片状态直到 FID 计算
     images_shape = batch_images.shape
     print(f"Calc FID for CFG {cfg_scale} and denoise_timesteps {denoise_timesteps}")
     progress_bar_total = num_generations // FLAGS.batch_size
     print(f"The progress bar (tqdm) will be initialized with a total of: {progress_bar_total}")
+    
+    # ========== Warmup: 防止 JIT 编译时间干扰吞吐率测量 ==========
+    print("\n🔥 Warmup: 运行 1 次推理以触发 JIT 编译...")
+    warmup_key = jax.random.PRNGKey(0)
+    warmup_x = jax.random.normal(warmup_key, images_shape)
+    warmup_labels = jax.random.randint(warmup_key, (images_shape[0],), 0, FLAGS.model.num_classes)
+    warmup_x, warmup_labels = shard_data(warmup_x, warmup_labels)
+    for ti in range(denoise_timesteps):
+        t = ti / denoise_timesteps
+        t_vector = jnp.full((images_shape[0], ), t)
+        if FLAGS.model.train_type == 'naive':
+            dt_flow = np.log2(FLAGS.model['denoise_timesteps']).astype(jnp.int32)
+            dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow
+        else:
+            dt_flow = np.log2(denoise_timesteps).astype(jnp.int32)
+            dt_base = jnp.ones(images_shape[0], dtype=jnp.int32) * dt_flow
+        t_vector, dt_base = shard_data(t_vector, dt_base)
+        v = call_model(train_state, warmup_x, t_vector, dt_base, warmup_labels)
+        warmup_x = warmup_x + v * (1.0 / denoise_timesteps)
+    if FLAGS.model.use_stable_vae:
+        _ = vae_decode(warmup_x)  # Warmup VAE decode
+    jax.block_until_ready(warmup_x)
+    print("✅ Warmup 完成!\n")
+    
+    # ========== 开始正式推理计时 ==========
+    print(f"🚀 开始推理，总生成数量: {num_generations}")
+    throughput_start_time = time.time()
+    
+    # 分段计时累加器
+    diffusion_time_total = 0.0
+    decoder_time_total = 0.0
+    other_time_total = 0.0
+    
     for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
         key = jax.random.PRNGKey(42)
         key = jax.random.fold_in(key, fid_it)
@@ -102,8 +135,10 @@ def do_inference(
         x = jax.random.normal(eps_key, images_shape)
         labels = jax.random.randint(label_key, (images_shape[0],), 0, FLAGS.model.num_classes)
         x, labels = shard_data(x, labels)
-        x0.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
         delta_t = 1.0 / denoise_timesteps
+        
+        # ========== Diffusion 推理计时 ==========
+        diffusion_start = time.time()
         for ti in range(denoise_timesteps):
             t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
             t_vector = jnp.full((images_shape[0], ), t)
@@ -130,21 +165,74 @@ def do_inference(
                 x = x1pred * (t+delta_t) + eps * (1-t-delta_t)
             else:
                 x = x + v * delta_t # Euler sampling.
-        x1.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
-        lab.append(np.array(jax.experimental.multihost_utils.process_allgather(labels)))
+        jax.block_until_ready(x)  # 确保 Diffusion 计算完成
+        diffusion_end = time.time()
+        diffusion_time_total += (diffusion_end - diffusion_start)
+        
+        # ========== VAE Decoder 计时 ==========
+        decoder_start = time.time()
         if FLAGS.model.use_stable_vae:
-            x = vae_decode(x) # Image is in [-1, 1] space.
-            if num_generations < 11000:
+            x = vae_decode(x) # Image is in [-1, 1] space for StableVAE, [0, 1] for TAESD
+            # 统一转换到 [-1, 1] 供 FID 计算
+            if FLAGS.vae_type == 'taesd':
+                x = x * 2.0 - 1.0  # [0,1] -> [-1,1]
+            # 只保存少量样本用于可视化，避免内存占用过大
+            # 只保存前 128 张（约 100 MB）
+            if len(x_render) * FLAGS.batch_size < 128:
                 x_render.append(np.array(jax.experimental.multihost_utils.process_allgather(x)))
+        jax.block_until_ready(x)  # 确保 Decoder 计算完成
+        decoder_end = time.time()
+        decoder_time_total += (decoder_end - decoder_start)
+        
+        # ========== 其他操作（FID特征提取等）计时 ==========
+        other_start = time.time()
         x = jax.image.resize(x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
         x = jnp.clip(x, -1, 1)
-        acts = get_fid_activations(x)[..., 0, 0, :] # [devices, batch//devices, 2048]
-        acts = jax.experimental.multihost_utils.process_allgather(acts)
-        acts = np.array(acts)
+        acts = get_fid_activations(x)[..., 0, 0, :]  # [devices, batch//devices, 2048]
+        # 不立即 allgather，保持分片状态以减少单个设备内存占用
+        acts = np.array(acts)  # 转为 numpy，但仍然是分片的
         activations.append(acts)
+        jax.block_until_ready(acts)  # 确保其他操作完成
+        other_end = time.time()
+        other_time_total += (other_end - other_start)
+    
+    # ========== 结束计时并输出分段吞吐率 ==========
+    throughput_end_time = time.time()
+    total_wall_time = throughput_end_time - throughput_start_time
+    
+    # 核心推理时间 = Diffusion + Decoder（不包括 FID 等后处理）
+    core_inference_time = diffusion_time_total + decoder_time_total
+    core_throughput = num_generations / core_inference_time if core_inference_time > 0 else 0
+    
+    # 计算各部分吞吐率
+    diffusion_throughput = num_generations / diffusion_time_total if diffusion_time_total > 0 else 0
+    decoder_throughput = num_generations / decoder_time_total if decoder_time_total > 0 else 0
+    
+    print(f"\n{'='*70}")
+    print(f"⏱️  核心推理耗时: {core_inference_time:.2f} 秒 (Diffusion + VAE Decoder)")
+    print(f"⚡ 核心推理吞吐率: {core_throughput:.2f} images/sec")
+    print(f"-" * 70)
+    print(f"🔄 Diffusion 推理:")
+    print(f"   耗时: {diffusion_time_total:.2f} 秒 ({diffusion_time_total/core_inference_time*100:.1f}%)")
+    print(f"   吞吐率: {diffusion_throughput:.2f} images/sec")
+    print(f"📦 VAE Decoder:")
+    print(f"   耗时: {decoder_time_total:.2f} 秒 ({decoder_time_total/core_inference_time*100:.1f}%)")
+    print(f"   吞吐率: {decoder_throughput:.2f} images/sec")
+    print(f"   (注: 推理模式从随机噪声生成，无需 Encoder)")
+    print(f"🔍 其他操作 (FID特征提取等):")
+    print(f"   耗时: {other_time_total:.2f} 秒 (不计入核心推理时间)")
+    print(f"-" * 70)
+    print(f"⏰ 总墙钟时间: {total_wall_time:.2f} 秒 (包含所有操作)")
+    print(f"📊 总生成数量: {num_generations}")
+    print(f"📦 Batch Size: {FLAGS.batch_size}")
+    print(f"🔄 推理步数: {denoise_timesteps}")
+    print(f"🎨 VAE 类型: {FLAGS.vae_type}")
+    print(f"{'='*70}\n")
     
     if jax.process_index() == 0:
-        activations = np.concatenate(activations, axis=0)
+        # 在计算 FID 前才 allgather，避免提前占用内存
+        activations_gathered = [jax.experimental.multihost_utils.process_allgather(a) for a in activations]
+        activations = np.concatenate(activations_gathered, axis=0)
         activations = activations.reshape((-1, activations.shape[-1]))
         mu1 = np.mean(activations, axis=0)
         sigma1 = np.cov(activations, rowvar=False)

@@ -42,7 +42,9 @@ def eval_model(
     def process_img(img):
         if FLAGS.model.use_stable_vae:
             img = vae_decode(img[None])[0]
-        img = img * 0.5 + 0.5
+        # TAESD 输出 [0,1]，StableVAE 输出 [-1,1]
+        if FLAGS.vae_type == 'stable':
+            img = img * 0.5 + 0.5  # [-1,1] -> [0,1]
         img = jnp.clip(img, 0, 1)
         img = np.array(img)
         return img
